@@ -2,116 +2,120 @@ const {
   util: { log }
 } = shelter
 
-let observer: MutationObserver | null = null // keep only one observer working
+let observer: MutationObserver | null = null
+const pendingRequests = new Set<WaitRequest>()
 
-export function disobserve() {
-  observer.disconnect()
-  observer = null
+type Query = Array<string> | string
+type WaitCfg = { callbackFn?: null | ((elm: Element) => void); root?: Element }
+
+interface WaitRequest {
+  path: Query[]
+  cfg: WaitCfg
+  resolve: (elm: Element) => void
+  lastNotifiedIndex: number
 }
 
-// Observes the DOM for newly added nodes and executes a callback for each.
-function observeDom<T>(rootElm: Node, callbackFn: (node: Node, resolve: (value: T) => void) => boolean, subtree: boolean): Promise<T> {
-  return new Promise(resolve => {
-    if (observer) disobserve() // disconnnect old one
+// Find the first element that matches the query in the root element
+const findInRoot = (root: Element, q: Query): Element | null => {
+  const selectors = Array.isArray(q) ? q : [q]
 
-    observer = new MutationObserver(mutations => {
-      for (const mutation of mutations) {
-        if (mutation.type === 'childList') {
-          const addedNodes = Array.from(mutation.addedNodes)
-          for (const node of addedNodes) {
-            if (!callbackFn(node, resolve)) {
-              return disobserve()
-            }
-          }
-        }
-      }
-    })
+  for (const selector of selectors) {
+    const isDirect = selector.startsWith('>')
+    const s = isDirect ? selector.slice(1) : selector
 
-    observer.observe(rootElm, {
-      childList: true,
-      subtree // reduce callback count for perf
-    })
+    const found = isDirect ? Array.from(root.children).find(c => c.matches(s)) : root.querySelector(s)
+    if (found) return found
+  }
+  return null
+}
+
+// Process a request by finding the element in the root element and executing the callback
+const processRequest = (req: WaitRequest): boolean => {
+  let currentRoot = req.cfg.root || document.body
+  if (!currentRoot) return false
+
+  let latestFound: Element = null
+  let stepIndex = 0
+
+  for (const q of req.path) {
+    const found = findInRoot(currentRoot, q)
+    if (!found) break
+
+    latestFound = found
+    if (stepIndex > req.lastNotifiedIndex) {
+      req.cfg.callbackFn?.(found)
+      req.lastNotifiedIndex = stepIndex
+    }
+
+    currentRoot = found
+    stepIndex++
+  }
+
+  if (stepIndex === req.path.length) {
+    req.resolve(latestFound || currentRoot)
+    return true
+  }
+
+  return false
+}
+
+// Process all pending requests
+const processAll = () => {
+  for (const req of pendingRequests) {
+    if (processRequest(req)) {
+      pendingRequests.delete(req)
+    }
+  }
+
+  if (pendingRequests.size === 0) {
+    stopObserver()
+  }
+}
+
+const startObserver = () => {
+  if (observer || !document.body) return
+  observer = new MutationObserver(processAll)
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['class', 'id']
   })
 }
 
-type Query = Array<string> | string
-type WaitCfg = { callbackFn: null | ((elm: Element) => void), root: Element }
-const subtreeFind = (p: Element, q: Array<string>) => Array.from(p.children).find(c => q.some(q => c.matches(q)))
-const queryFind = (p: Element, query: Array<string>) => {
-  for (let q of query) {
-    const subtree = q[0] === '>'
-    if (subtree) q = q.slice(1)
-    const elm = subtree ? subtreeFind(p, [q]) : p.querySelector(q)
-    if (elm) return elm
-  }
+const stopObserver = () => {
+  observer?.disconnect()
+  observer = null
 }
 
-export const waitForElm = async (queries: Array<Query> | Query, cfg: Partial<WaitCfg>): Promise<Element> => {
-  let root = cfg.root || document.body
-  const callbackFn = cfg.callbackFn
+export function disobserve() {
+  pendingRequests.clear()
+  stopObserver()
+}
 
-  let query: string[]
-  let timeout = true
-  const startTimeout = () => setTimeout(() => {
-    if (timeout) {
-      log(['The observer seems stuck at', root, 'looking for', query, 'with remaining queries:', queries], 'warn')
-      startTimeout()
-    }
-  }, 10000)
+// Observes the DOM for newly added nodes and executes a callback for each.
+export const waitForElm = async (queries: Array<Query> | Query, cfg: Partial<WaitCfg> = {}): Promise<Element> => {
+  const path: Query[] = Array.isArray(queries) && (queries.length === 0 || typeof queries[0] === 'string' || Array.isArray(queries[0])) ? (queries as Query[]) : ([queries] as Query[])
 
-  startTimeout()
-
-  if (!Array.isArray(queries)) queries = [queries]
-
-  while (queries.length) {
-    // prepare query
-    const q: Query = queries.shift()
-    query = typeof q === 'string' ? [q] : q
-    const directChild = query.every(q => q[0] === '>')
-
-    if (directChild) query = query.map(q => q.slice(1))
-
-    // no observe if this elm already exist
-    const elm = directChild ? subtreeFind(root, query) : queryFind(root, query)
-
-    if (elm) {
-      root = elm
-      if (callbackFn) callbackFn(root)
-      continue
+  return new Promise(resolve => {
+    const req: WaitRequest = {
+      path,
+      cfg,
+      resolve, // pass resolve to the observer
+      lastNotifiedIndex: -1
     }
 
-    // start observer
-    root = await observeDom(root, (node, res) => {
-      if (node.nodeType !== Node.ELEMENT_NODE) return true
+    if (processRequest(req)) return // elm already found
 
-      const e = node as Element
+    pendingRequests.add(req)
+    startObserver()
 
-      for (let q of query) {
-        if (!directChild) {
-          const s = q[0] === '>'
-          if (s) q = q.slice(1)
-        }
-
-        let ret = e.matches(q) ? e : null
-
-        if (!ret) {
-          ret = e.querySelector(q)
-        }
-
-        if (ret) {
-          res(e)
-          return false
-        }
+    const checkLogged = () => {
+      if (pendingRequests.has(req)) {
+        log(['The observer seems stuck looking for:', path, 'at root:', cfg.root || document.body], 'warn')
+        setTimeout(checkLogged, 10000)
       }
-
-      return true
-    }, !directChild) as Element
-
-    // callback after found
-    if (callbackFn) callbackFn(root)
-  }
-
-  timeout = false
-
-  return root
+    }
+    setTimeout(checkLogged, 10000)
+  })
 }
